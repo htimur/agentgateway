@@ -1425,12 +1425,28 @@ pub mod from_messages {
 					push_content(&mut contents, "user", parts);
 				},
 				Role::Assistant => {
+					// A functionCall's thoughtSignature comes back in a Thinking block keyed by the
+					// tool_use id (GeminiThoughtSignature), as on the Messages <-> Completions route.
+					let mut call_signatures: HashMap<String, String> = m
+						.content
+						.iter()
+						.filter_map(|block| match block {
+							ContentBlock::Thinking { signature, .. } => {
+								crate::conversion::GeminiThoughtSignature::decode(signature)
+							},
+							_ => None,
+						})
+						.map(|carrier| (carrier.call_id, carrier.signature))
+						.collect();
 					let mut parts: Vec<vg::Part> = Vec::new();
 					for block in &m.content {
 						match block {
 							ContentBlock::Text(t) if !t.text.is_empty() => {
 								parts.push(text_part(&t.text));
 							},
+							// Already attached to its functionCall below, not a thought of its own.
+							ContentBlock::Thinking { signature, .. }
+								if crate::conversion::GeminiThoughtSignature::decode(signature).is_some() => {},
 							ContentBlock::Thinking {
 								thinking,
 								signature,
@@ -1449,7 +1465,10 @@ pub mod from_messages {
 							ContentBlock::ToolUse {
 								id, name, input, ..
 							} => {
-								let (_, thought_signature) = split_tool_call_id(id);
+								// An id issued with the signature embedded still carries it.
+								let thought_signature = call_signatures
+									.remove(id)
+									.or_else(|| split_tool_call_id(id).1.map(str::to_string));
 								// Invariant: Vertex rejects `id` on functionCall parts.
 								parts.push(vg::Part::FunctionCall(vg::FunctionCallPart {
 									function_call: vg::FunctionCall {
@@ -1459,7 +1478,7 @@ pub mod from_messages {
 										rest: Value::Null,
 									},
 									thought: None,
-									thought_signature: thought_signature.map(str::to_string),
+									thought_signature,
 									rest: Value::Null,
 								}));
 							},
@@ -2266,13 +2285,20 @@ pub mod to_messages {
 					cache_control: None,
 				}));
 			}
-			blocks.extend(decoded.calls.iter().enumerate().map(|(idx, call)| {
-				let base_id = call
+			for (idx, call) in decoded.calls.iter().enumerate() {
+				let id = call
 					.id
 					.map(str::to_string)
 					.unwrap_or_else(|| format!("toolu_{seed}_{idx}"));
-				let id = join_tool_call_id(base_id, call.thought_signature);
-				messages::ContentBlock::ToolUse {
+				// The signature rides in a Thinking block just before its tool_use, not in the id:
+				// clients rewrite ids to Anthropic's [a-zA-Z0-9_-], which corrupts base64.
+				if let Some(signature) = call.thought_signature.filter(|s| !s.is_empty()) {
+					blocks.push(messages::ContentBlock::Thinking {
+						thinking: String::new(),
+						signature: crate::conversion::GeminiThoughtSignature::encode(&id, signature),
+					});
+				}
+				blocks.push(messages::ContentBlock::ToolUse {
 					id,
 					name: call.name.to_string(),
 					input: if call.args.is_null() {
@@ -2281,8 +2307,8 @@ pub mod to_messages {
 						call.args.clone()
 					},
 					cache_control: None,
-				}
-			}));
+				});
+			}
 
 			(blocks, Some(stop_reason))
 		};
@@ -2671,8 +2697,6 @@ pub mod to_messages {
 								.as_deref()
 								.map(str::to_string)
 								.unwrap_or_else(|| format!("toolu_{id}_{call_idx}"));
-							// Log the plain id, before the thoughtSignature is joined on: the signature is
-							// a multi-KB opaque blob and would bloat every logged tool call.
 							if let Some(pending) = self.pending_tool_calls.as_mut() {
 								pending.push(crate::OutputMessagePart::ToolCall {
 									id: strng::new(&base_id),
@@ -2680,7 +2704,25 @@ pub mod to_messages {
 									arguments: fc.function_call.args.clone(),
 								});
 							}
-							let tool_id = join_tool_call_id(base_id, fc.thought_signature.as_deref());
+							// The signature rides in a Thinking block just before its tool_use, not in
+							// the id: clients rewrite ids to Anthropic's [a-zA-Z0-9_-], which corrupts
+							// base64.
+							if let Some(signature) = fc.thought_signature.as_deref().filter(|s| !s.is_empty()) {
+								let idx = self.open_block(BlockKind::Thinking, &mut out);
+								out.push(
+									messages::MessagesStreamEvent::ContentBlockDelta {
+										index: idx,
+										delta: messages::ContentBlockDelta::SignatureDelta {
+											signature: crate::conversion::GeminiThoughtSignature::encode(
+												&base_id, signature,
+											),
+										},
+									}
+									.into_sse_tuple(),
+								);
+								self.close_open_block(&mut out);
+							}
+							let tool_id = base_id;
 							let block_idx = self.block_index;
 							out.push(
 								messages::MessagesStreamEvent::ContentBlockStart {

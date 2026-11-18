@@ -2712,6 +2712,134 @@ fn msg_stream_tool_call_block() {
 	assert_eq!(events[4]["delta"]["stop_reason"], "tool_use");
 }
 
+// ---------- Thought signatures on tool calls: Messages route ----------
+
+// A real-shaped thoughtSignature: standard base64 with '+', '/' and '=' padding.
+const STD_SIGNATURE: &str = "AY89a1+BtCt7/pjBAy9wQQ==";
+
+/// What OpenCode does to every tool_use id it sends back
+/// (`scrubToolCallID` in packages/ai/src/protocols/anthropic-messages.ts).
+fn scrub_like_opencode(id: &str) -> String {
+	id.chars()
+		.map(|c| {
+			if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+				c
+			} else {
+				'_'
+			}
+		})
+		.collect()
+}
+
+fn signed_call_response() -> Value {
+	json!({
+		"candidates": [{
+			"content": { "role": "model", "parts": [
+				{ "functionCall": { "name": "get_weather", "args": { "city": "Berlin" } },
+					"thoughtSignature": STD_SIGNATURE }
+			]},
+			"finishReason": "STOP"
+		}]
+	})
+}
+
+#[test]
+fn msg_resp_tool_call_signature_rides_in_thinking_block() {
+	let r = msg_resp(signed_call_response());
+	let tool_use = &r["content"][1];
+	assert_eq!(tool_use["type"], "tool_use", "got: {r}");
+	let id = tool_use["id"].as_str().unwrap();
+	assert_eq!(
+		scrub_like_opencode(id),
+		id,
+		"the id must carry no signature, got: {id}"
+	);
+
+	let carrier = &r["content"][0];
+	assert_eq!(carrier["type"], "thinking", "got: {r}");
+	assert_eq!(carrier["thinking"], "");
+	let decoded =
+		crate::conversion::GeminiThoughtSignature::decode(carrier["signature"].as_str().unwrap())
+			.expect("the thinking block carries the signature");
+	assert_eq!(decoded.call_id, id);
+	assert_eq!(decoded.signature, STD_SIGNATURE);
+}
+
+#[test]
+fn msg_stream_tool_call_signature_rides_in_thinking_block() {
+	let mut s = to_messages::StreamState::new(crate::LogContentFields::default());
+	let events = msg_stream_chunk(&mut s, signed_call_response());
+	let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+	assert_eq!(
+		types,
+		[
+			"message_start",
+			"content_block_start",
+			"content_block_delta",
+			"content_block_stop",
+			"content_block_start",
+			"content_block_delta",
+			"content_block_stop",
+			"message_delta",
+			"message_stop",
+		],
+		"got: {events:?}"
+	);
+	assert_eq!(events[1]["content_block"]["type"], "thinking");
+	assert_eq!(events[2]["delta"]["type"], "signature_delta");
+	assert_eq!(events[4]["content_block"]["type"], "tool_use");
+	assert_eq!(events[4]["index"], events[1]["index"].as_u64().unwrap() + 1);
+
+	let id = events[4]["content_block"]["id"].as_str().unwrap();
+	assert_eq!(
+		scrub_like_opencode(id),
+		id,
+		"the id must carry no signature, got: {id}"
+	);
+	let decoded = crate::conversion::GeminiThoughtSignature::decode(
+		events[2]["delta"]["signature"].as_str().unwrap(),
+	)
+	.expect("the signature delta carries the signature");
+	assert_eq!(decoded.call_id, id);
+	assert_eq!(decoded.signature, STD_SIGNATURE);
+}
+
+#[test]
+fn msg_signature_survives_a_client_that_scrubs_tool_use_ids() {
+	// Turn 1 as the client received it, echoed back the way OpenCode sends it.
+	let mut assistant = msg_resp(signed_call_response())["content"].clone();
+	let id = scrub_like_opencode(assistant[1]["id"].as_str().unwrap());
+	assistant[1]["id"] = json!(id);
+
+	let g = to_gemini_msg(json!({
+		"model": "gemini-3-pro",
+		"max_tokens": 1024,
+		"messages": [
+			{ "role": "user", "content": "weather in Berlin?" },
+			{ "role": "assistant", "content": assistant },
+			{ "role": "user", "content": [
+				{ "type": "tool_result", "tool_use_id": id, "content": "sunny" }
+			]}
+		]
+	}));
+
+	let model_parts = g["contents"][1]["parts"].as_array().unwrap();
+	assert_eq!(
+		model_parts.len(),
+		1,
+		"the carrier must not become a thought part of its own, got: {g}"
+	);
+	assert_eq!(model_parts[0]["functionCall"]["name"], "get_weather");
+	assert_eq!(
+		model_parts[0]["thoughtSignature"], STD_SIGNATURE,
+		"got: {g}"
+	);
+	assert_eq!(
+		g["contents"][2]["parts"][0]["functionResponse"]["name"], "get_weather",
+		"got: {g}"
+	);
+}
+
 #[test]
 fn msg_stream_text_continues_across_chunks() {
 	let mut s = to_messages::StreamState::new(crate::LogContentFields::default());
